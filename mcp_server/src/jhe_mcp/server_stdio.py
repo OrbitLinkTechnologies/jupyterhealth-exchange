@@ -14,6 +14,13 @@ from jhe_mcp.core import build_server
 
 
 def main() -> None:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
     settings = Settings.from_env()
     cache = TokenCache.default()
 

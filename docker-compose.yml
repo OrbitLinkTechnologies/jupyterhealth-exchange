@@ -1,0 +1,77 @@
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  jhe-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "manage.py", "migrate", "--noinput"]
+
+  jhe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    depends_on:
+      jhe-migrate:
+        condition: service_completed_successfully
+
+  jhe-cron:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+    depends_on:
+      jhe-migrate:
+        condition: service_completed_successfully
+    command: ["supercronic", "/code/deploy/crontab"]
+
+  jhe-mcp:
+    build:
+      context: ./mcp_server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: ./mcp_server/.env
+    environment:
+      JHE_BASE_URL: http://jhe:8000
+    depends_on:
+      - jhe
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - jhe
+      - jhe-mcp
+
+volumes:
+  postgres_data:

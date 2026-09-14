@@ -63,6 +63,13 @@ def configure_logging() -> None:
 def main() -> None:
     import uvicorn
 
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
     configure_logging()
     settings = Settings.from_env()
     app = build_app(settings)
