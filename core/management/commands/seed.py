@@ -113,6 +113,11 @@ class Command(BaseCommand):
             action="store_true",
             help="After the base seed, also generate the synthetic CGM + Oura demo cohort.",
         )
+        parser.add_argument(
+            "--password",
+            default="Jhe1234!",
+            help="Password to set for the seeded admin superuser and all seeded practitioner/patient users (default: Jhe1234!).",
+        )
 
     # -- uniform step reporting ------------------------------------------------------
     #
@@ -166,10 +171,14 @@ class Command(BaseCommand):
             self.stdout.write("Flushing the database…")
             call_command("flush", "--noinput")
 
+        self.seed_password = options["password"]
+
         Application = get_application_model()
         with transaction.atomic():
             self.reset_sequences()
-            self._step("superuser", (JheUser, Practitioner), self.generate_superuser)
+            self._step(
+                "superuser", (JheUser, Practitioner), self.generate_superuser, password=self.seed_password
+            )
             self._step("settings", (JheSetting,), self.seed_jhe_settings)
             self._step("codeable concepts", (CodeableConcept,), self.seed_codeable_concepts)
             self._step("data sources", (DataSource, DataSourceSupportedScope), self.seed_data_sources)
@@ -911,10 +920,10 @@ class Command(BaseCommand):
             },
         )
 
-    def create_user_with_profile(self, email, user_type="practitioner", password="Jhe1234!"):
+    def create_user_with_profile(self, email, user_type="practitioner", password=None):
         user = JheUser.objects.create_user(
             email=email,
-            password=password or get_random_string(length=16),
+            password=password or self.seed_password or get_random_string(length=16),
             first_name=email.split("@")[0].replace("_", " ").title().replace(" ", ""),
             last_name=fake.last_name(),
             user_type=user_type,
