@@ -63,14 +63,22 @@ services:
     depends_on:
       - jhe
 
-  cloudflared:
+  cloudflared-jhe:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     command: tunnel run
     environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN_JHE}
     depends_on:
       - jhe
+
+  cloudflared-mcp:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN_MCP}
+    depends_on:
       - jhe-mcp
 
 volumes:
