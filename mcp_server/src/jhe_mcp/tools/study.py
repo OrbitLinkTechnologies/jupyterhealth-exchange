@@ -44,9 +44,19 @@ async def get_study_metadata(*, study_id: str, base_url: str) -> StudyMeta | Non
 
 async def list_study_patients(*, study_id: str, base_url: str) -> list[StudyPatient]:
     """Patients enrolled in a study."""
+    results: list[StudyPatient] = []
     async with JheClient(base_url) as client:
-        data = await client.admin_get(f"studies/{study_id}/patients")
-        return [StudyPatient.from_admin(item) for item in data]
+        params: dict[str, Any] = {}
+        path = f"studies/{study_id}/patients"
+        while True:
+            data = await client.admin_get(path, params=params or None)
+            results.extend(StudyPatient.from_admin(item) for item in data.get("results", []))
+            next_url = data.get("next")
+            if not next_url:
+                break
+            next_qs = parse_qs(urlparse(next_url).query)
+            params = {k: v[0] for k, v in next_qs.items()}
+    return results
 
 
 async def get_patient_demographics(*, patient_id: str, base_url: str) -> Demographics | None:

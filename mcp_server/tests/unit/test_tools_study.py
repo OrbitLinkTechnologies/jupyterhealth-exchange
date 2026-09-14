@@ -136,16 +136,38 @@ async def test_list_studies_offset_pagination(auth, fake_client):
 
 @pytest.mark.asyncio
 async def test_list_study_patients(auth, fake_client):
-    fake_client.admin_get.return_value = [
-        {"id": 1, "nameGiven": "Pat", "nameFamily": "Jones", "telecomEmail": "pat@ex.com"},
-        {"id": 2, "nameGiven": "Sam", "nameFamily": "Smith", "telecomEmail": "sam@ex.com"},
-    ]
+    fake_client.admin_get.return_value = {
+        "results": [
+            {"id": 1, "nameGiven": "Pat", "nameFamily": "Jones", "telecomEmail": "pat@ex.com"},
+            {"id": 2, "nameGiven": "Sam", "nameFamily": "Smith", "telecomEmail": "sam@ex.com"},
+        ],
+        "next": None,
+    }
     patients = await list_study_patients(study_id="5", base_url="http://jhe")
     assert len(patients) == 2
     assert patients[0].patient_id == "1"
     assert patients[0].email == "pat@ex.com"
     assert patients[1].family_name == "Smith"
-    fake_client.admin_get.assert_awaited_once_with("studies/5/patients")
+    fake_client.admin_get.assert_awaited_once_with("studies/5/patients", params=None)
+
+
+@pytest.mark.asyncio
+async def test_list_study_patients_paginated(auth, fake_client):
+    fake_client.admin_get.side_effect = [
+        {
+            "results": [{"id": 1, "nameGiven": "Pat", "nameFamily": "Jones", "telecomEmail": "pat@ex.com"}],
+            "next": "http://jhe/api/v1/studies/5/patients?page=2",
+        },
+        {
+            "results": [{"id": 2, "nameGiven": "Sam", "nameFamily": "Smith", "telecomEmail": "sam@ex.com"}],
+            "next": None,
+        },
+    ]
+    patients = await list_study_patients(study_id="5", base_url="http://jhe")
+    assert len(patients) == 2
+    assert patients[0].patient_id == "1"
+    assert patients[1].patient_id == "2"
+    assert fake_client.admin_get.await_count == 2
 
 
 @pytest.mark.asyncio
