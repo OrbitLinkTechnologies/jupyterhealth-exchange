@@ -22,6 +22,7 @@ from core.models import (
     DataSourceSupportedScope,
     EhrBrand,
     EhrBrandLocation,
+    EhrVendor,
     FhirAuxResource,
     FhirSource,
     JheClient,
@@ -76,26 +77,6 @@ def sleep_episode_data_point(start, hours_asleep, awakenings):
             "is_main_sleep": True,
         },
     }
-
-
-# aux_data keys seed owns outright: their value is derived from application code (the
-# scope list must match EHR_PATIENT_PORTAL_PULLS), so a stale deployed value is a bug and seed
-# overwrites it on every run. Every other key -- notably the EHR-registered `client_id`,
-# which differs per deployment -- belongs to whoever set it and is preserved.
-SEED_MANAGED_AUX_KEYS = frozenset({"scopes"})
-
-
-def _merged_aux_data(existing, seeded):
-    """Seeded aux_data merged over `existing`: seed fills gaps, operator values win, code wins.
-
-    Ordering is deliberate. Seeded values are defaults for keys the row does not have yet;
-    anything already stored beats them, so re-seeding never clobbers deployment-specific
-    config; and the seed-managed keys are then re-applied last so a code-owned value can
-    never go stale on an existing row.
-    """
-    merged = {**seeded, **(existing or {})}
-    merged.update({key: value for key, value in seeded.items() if key in SEED_MANAGED_AUX_KEYS})
-    return merged
 
 
 class Command(BaseCommand):
@@ -194,6 +175,7 @@ class Command(BaseCommand):
                     Observation,
                     FhirSource,
                     FhirAuxResource,
+                    EhrVendor,
                     EhrBrand,
                     EhrBrandLocation,
                 ),
@@ -228,12 +210,14 @@ class Command(BaseCommand):
 
         jhe_settings = [
             # Honor the SITE_URL env so the seeded host matches where JHE is actually
-            # served (e.g. http://localhost:8001 for the EHR Patient Portal client). Defaults to
-            # http://localhost:8000 when SITE_URL is unset, preserving prior behavior.
-            # Invitation links embed this host, so a mismatch sends redemption to the
-            # wrong server.
+            # served (e.g. http://localhost:8001 when running JHE itself on a non-default
+            # port for Open Wearables testing). Defaults to http://localhost:8000 when
+            # SITE_URL is unset, preserving prior behavior. Invitation links embed this
+            # host, so a mismatch sends redemption to the wrong server.
             ("site.url", "string", settings.SITE_URL),
             ("site.ui.title", "string", "JupyterHealth Exchange"),
+            ("site.ui.logo", "string", ""),  # static path of a deployment's own logo for patient-facing pages
+            ("site.ui.theme_css", "string", ""),  # static path of a stylesheet overriding the --pf-* tokens/fonts
             ("site.time_zone", "string", "America/Los_Angeles"),
             ("site.registration_invite_code", "string", invite_code),
             ("auth.default_orgs", "string", ""),  # "20001:viewer;20002:member"
@@ -259,7 +243,7 @@ class Command(BaseCommand):
                 "json",
                 ["https://fhir.epic.com/interconnect-fhir-oauth/oauth2"],
             ),
-            ("auth.sof.trusted_audience", "string", "77849e74-8e2a-4c2f-826c-bdbef6da3357"),
+            ("auth.sof.trusted_audience", "json", ["77849e74-8e2a-4c2f-826c-bdbef6da3357"]),
             # Open Wearables polling pipeline (see ow_poll management command).
             ("module.ow", "bool", False),
             ("ow.sync_in_progress", "string", ""),
@@ -270,6 +254,7 @@ class Command(BaseCommand):
             ("ow.api_url", "string", "http://localhost:8001"),
             ("ow.api_key", "string", ""),
             ("ow.poll_window_days", "int", 1),
+            ("ow.sleep_lookback_days", "int", 7),
         ]
         for key, value_type, value in jhe_settings:
             setting, _ = JheSetting.objects.update_or_create(
@@ -322,6 +307,7 @@ class Command(BaseCommand):
             (omh, "omh:respiratory-rate:2.0", "Respiratory rate (OMH)"),
             (omh, "omh:rr-interval:1.0", "RR Interval (OMH)"),
             (omh, "omh:body-weight:3.0", "Body weight (OMH)"),
+            (omh, "omh:body-height:2.0", "Body height (OMH)"),
             (omh, "omh:forced-vital-capacity:1.0", "Forced vital capacity (OMH)"),
             (omh, "omh:forced-expiratory-volume-1-second:1.0", "Forced expiratory volume 1 second (OMH)"),
             (omh, "omh:physical-activity:1.2", "Physical activity (OMH)"),
@@ -352,7 +338,22 @@ class Command(BaseCommand):
             ("CareX", "personal_device", ["omh:blood-pressure:4.0", "omh:heart-rate:2.0"]),
             ("Dexcom Stelo", "personal_device", ["omh:blood-glucose:4.0"]),
             ("iHealth", "personal_device", ["omh:body-temperature:4.0", "omh:heart-rate:2.0"]),
-            ("Oura", "personal_device", ["omh:heart-rate:2.0", "ieee:sleep-episode:1.0"]),
+            (
+                "Oura",
+                "personal_device",
+                [
+                    "omh:heart-rate:2.0",
+                    "omh:oxygen-saturation:2.0",
+                    "omh:respiratory-rate:2.0",
+                    "omh:body-weight:3.0",
+                    "omh:body-height:2.0",
+                    "ieee:sleep-episode:1.0",
+                    "ieee:sleep-stage-summary:1.0",
+                    "ieee:time-in-bed:1.0",
+                    "ieee:total-sleep-time:1.0",
+                    "ieee:physical-activity:1.0",
+                ],
+            ),
             ("Questionnaire", "patient_app", ["QuestionnaireResponse"]),
             # Source for clinical records pulled from an EHR's patient-access FHIR API
             # (#489). Shares its name with the client of the same name -- one product, one
@@ -399,7 +400,8 @@ class Command(BaseCommand):
             },
             {
                 # SMART on FHIR patient EHR-records client (issue #489). Served on JHE's
-                # normal :8001, which the Epic app has registered as a redirect.
+                # own default :8000 -- there is no separate service for this client (unlike
+                # Open Wearables above), so it has no reason to live on a different port.
                 #
                 # The row, its DataSource and its URL path are all "EHR Patient Portal".
                 # The earlier name "Patient Access" collided with the unrelated
@@ -409,38 +411,19 @@ class Command(BaseCommand):
                 # NOTE: this app's redirect_uris is the JHE OAuth callback (the default
                 # /auth/callback, used by the invitation -> /o/token exchange), NOT the
                 # Epic callback. The Epic callback URLs
-                # (http://localhost:8001/clients/ehr-patient-portal/callback and the
+                # (http://localhost:8000/clients/ehr-patient-portal/callback and the
                 # jhe.fly.dev equivalent) are registered separately on the Epic app at
                 # fhir.epic.com -- they must be updated there in step with this path.
                 "name": "EHR Patient Portal",
-                "invitation_url": "http://localhost:8001/clients/ehr-patient-portal/?code=CODE",
+                "invitation_url": "http://localhost:8000/clients/ehr-patient-portal/?code=CODE",
                 # The client and its DataSource are one and the same product (as with CareX),
                 # so they share a name and are linked here. That ClientDataSource row is the
                 # only link: the connect page reads the data source id through it, never by
                 # looking a name up at request time.
                 "data_sources": ["EHR Patient Portal"],
-                # No iss here: the hospital the patient picks supplies it (EhrBrand.fhir_base_url).
-                "aux_data": {
-                    # Non-production client id of the Epic app "JupyterHealth Exchange -
-                    # USCDI v3" (appId 55446), the app that has the localhost:8001 +
-                    # jhe.fly.dev /clients/ehr-patient-portal/callback redirect URIs registered.
-                    # (Same Epic sandbox app/client id used in the Phase 1 POC.)
-                    "client_id": "77849e74-8e2a-4c2f-826c-bdbef6da3357",
-                    # One read scope per EHR_PATIENT_PORTAL_PULLS type (client-ehr-patient-portal.js);
-                    # the Epic app registration already covers all of these APIs.
-                    "scopes": (
-                        "openid profile launch/patient"
-                        " patient/Patient.read patient/Observation.read patient/Condition.read"
-                        " patient/MedicationRequest.read patient/MedicationDispense.read"
-                        " patient/AllergyIntolerance.read patient/Immunization.read"
-                        " patient/Procedure.read patient/DiagnosticReport.read"
-                        " patient/DocumentReference.read patient/Encounter.read"
-                        " patient/CarePlan.read patient/CareTeam.read patient/Goal.read"
-                        " patient/ServiceRequest.read"
-                        " patient/Device.read"
-                        " patient/QuestionnaireResponse.read"
-                    ),
-                },
+                # No iss here: the hospital the patient picks supplies it, from
+                # EhrBrand.fhir_base_url. client_id/scopes come from that brand's EhrVendor
+                # (see seed_example_institute's EhrVendor seeding, below).
             },
         ]
 
@@ -456,18 +439,13 @@ class Command(BaseCommand):
                     "algorithm": "RS256",
                 },
             )
-            # Create the JheClient explicitly (there is no post_save signal) and keep the
-            # seed-managed aux_data keys current on every run -- not just on creation. That
-            # create-only guard is why widening the Patient Access scopes needed migration
-            # 0043: the deployed row could not pick a code-owned value up from seed at all.
+            # Create the JheClient explicitly (there is no post_save signal).
             jhe_client, _ = JheClient.objects.get_or_create(application=app)
             if created:
                 # Deployment-specific: a deployment's real invitation host is not the seeded
                 # localhost URL, so this is written once and never overwritten.
                 jhe_client.invitation_url = client["invitation_url"]
-            if client.get("aux_data") is not None:
-                jhe_client.aux_data = _merged_aux_data(jhe_client.aux_data, client["aux_data"])
-            jhe_client.save()
+                jhe_client.save()
 
             for ds_name in client["data_sources"]:
                 ds = DataSource.objects.get(name=ds_name)
@@ -476,6 +454,25 @@ class Command(BaseCommand):
     @staticmethod
     def create_root_organization():
         return Organization.objects.create(id=0, name="ROOT", type="root")
+
+    @staticmethod
+    def seed_ehr_vendor_sandbox_config():
+        """Fill in the Epic Sandbox vendor's OAuth config so the end-to-end connect flow (#489)
+        works out of the box against Epic's sandbox brand. Fill-gap only, like the deployment
+        client_id this replaced: an operator's edits via the EHRs admin page must survive a
+        reseed. Epic Production is left blank -- a production Epic app needs Epic's own
+        certification/registration process, which seed can't do for an operator."""
+        epic_vendor = EhrVendor.objects.filter(name="Epic Sandbox").first()
+        if epic_vendor and not epic_vendor.ehr_client_id:
+            # Non-production client id of the Epic app "JupyterHealth Exchange - USCDI v3"
+            # (appId 55446). (Same Epic sandbox app/client id used in the Phase 1 POC.)
+            # NOTE: this app's registered redirect URIs at fhir.epic.com must include
+            # http://localhost:8000/clients/ehr-patient-portal/callback (plus the
+            # jhe.fly.dev equivalent) to match the invitation_url above -- update it there
+            # if it still only has the old :8001 callback registered.
+            epic_vendor.ehr_client_id = "77849e74-8e2a-4c2f-826c-bdbef6da3357"
+            epic_vendor.supported_scopes = " ".join(EhrVendor.SUPPORTED_SCOPES)
+            epic_vendor.save()
 
     def seed_example_institute(self, root_organization):
         planetary_research_institute = Organization.objects.create(
@@ -524,6 +521,9 @@ class Command(BaseCommand):
         code_omh_hr = CodeableConcept.objects.get(coding_code="omh:heart-rate:2.0")
         code_ieee_sleep = CodeableConcept.objects.get(coding_code=SLEEP_EPISODE_CODE)
         code_fhir_qr = CodeableConcept.objects.get(coding_code="QuestionnaireResponse")
+        code_fhir_star = CodeableConcept.objects.get(
+            coding_system="http://hl7.org/fhir/resource-types", coding_code="*"
+        )
 
         StudyScopeRequest.objects.create(study=lifespan_study_bp_hr, scope_code=code_omh_bp)
         StudyScopeRequest.objects.create(study=lifespan_study_bp_hr, scope_code=code_omh_hr)
@@ -552,10 +552,16 @@ class Command(BaseCommand):
         ehr_patient_portal_client = get_application_model().objects.get(name="EHR Patient Portal")
         StudyClient.objects.create(study=lifespan_study_bp_hr, client=ehr_patient_portal_client)
 
+        # Also requests clinical records via the EHR Patient Portal; left pending so the demo starts unconsented.
+        ehr_patient_portal_ds = DataSource.objects.get(name="EHR Patient Portal")
+        StudyDataSource.objects.create(study=lifespan_study_bp_hr, data_source=ehr_patient_portal_ds)
+        StudyScopeRequest.objects.create(study=lifespan_study_bp_hr, scope_code=code_fhir_star)
+
         # Seed EHR hospital brands so the EHR Patient Portal hospital picker (#489) has data to
         # search out of the box. Uses the curated sample bundle; production imports the
         # full Epic file via `manage.py import_ehr_brands --file <download>`.
         call_command("import_ehr_brands", stdout=io.StringIO())
+        self.seed_ehr_vendor_sandbox_config()
 
         ll_patient_pete = self.create_user_with_profile("ll_patient_peter@example.com", user_type="patient")
         ll_patient_pete.organizations.add(lifespan_lab)
@@ -928,8 +934,6 @@ class Command(BaseCommand):
             last_name=fake.last_name(),
             user_type=user_type,
         )
-        user.identifier = f"fhir-{str(user.id)[-1] * 3}"
-        user.save()
         if user_type == "practitioner":
             practitioner = user.practitioner_profile
             practitioner.birth_date = fake.date_of_birth(minimum_age=25, maximum_age=45)

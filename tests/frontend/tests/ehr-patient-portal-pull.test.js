@@ -1,7 +1,15 @@
 import { describe, test, expect, beforeAll, beforeEach, jest } from "@jest/globals";
+const fs = require("fs");
+const path = require("path");
 
-// client-ehr-patient-portal.js exposes eppPullResourceType + eppWriteResource on window.
+const STATIC = path.resolve(__dirname, "../../../core/static");
+
+// client-ehr-patient-portal.js references getStoredToken/pfRender from patient-facing.js, and
+// exposes eppPullResourceType + eppWriteResource on window.
 beforeAll(() => {
+  global.Handlebars = require(path.join(STATIC, "common/js/handlebars.min.js"));
+  require(path.join(STATIC, "common/js/common.js"));
+  require(path.join(STATIC, "common/js/patient-facing.js"));
   require("../../../core/static/clients/ehr-patient-portal/js/client-ehr-patient-portal.js");
 });
 
@@ -67,13 +75,29 @@ describe("eppWriteResource", () => {
 
   test("reports ok when the import entry status is 2xx", async () => {
     global.fetch = jest.fn(() => importResponse("201 Created"));
-    expect(await window.eppWriteResource("tok", "1", "Condition", {})).toEqual({ ok: true, reason: null, warnings: [] });
+    expect(await window.eppWriteResource("tok", "1", "Condition", {})).toEqual({
+      ok: true,
+      created: true,
+      reason: null,
+      warnings: [],
+    });
+  });
+
+  test("reports created false when the entry is 200 (a record already stored under this source)", async () => {
+    global.fetch = jest.fn(() => importResponse("200 OK"));
+    expect(await window.eppWriteResource("tok", "1", "Condition", {})).toEqual({
+      ok: true,
+      created: false,
+      reason: null,
+      warnings: [],
+    });
   });
 
   test("reports the entry's OperationOutcome error when the status is 4xx", async () => {
     global.fetch = jest.fn(() => importResponse("400 invalid", errorOutcome("clinicalStatus: field required")));
     expect(await window.eppWriteResource("tok", "1", "MedicationRequest", {})).toEqual({
       ok: false,
+      created: false,
       reason: "clinicalStatus: field required",
       warnings: [],
     });
@@ -83,6 +107,7 @@ describe("eppWriteResource", () => {
     global.fetch = jest.fn(() => importResponse("400 invalid"));
     expect(await window.eppWriteResource("tok", "1", "MedicationRequest", {})).toEqual({
       ok: false,
+      created: false,
       reason: "400 invalid",
       warnings: [],
     });
@@ -99,6 +124,7 @@ describe("eppWriteResource", () => {
     );
     expect(await window.eppWriteResource("tok", "1", "Condition", {})).toEqual({
       ok: false,
+      created: false,
       reason: 'HTTP 403: {"detail":"missing patient/Condition.read scope"}',
       warnings: [],
     });
@@ -126,8 +152,8 @@ describe("eppWriteBundle", () => {
     expect(url).toMatch(/\/fhir-import\/R4\/$/); // the bundle route, no resource type suffix
     expect(JSON.parse(opts.body).entry).toHaveLength(2);
     expect(writes).toEqual([
-      { ok: true, reason: null, warnings: [] },
-      { ok: false, reason: "boom", warnings: [] },
+      { ok: true, created: true, reason: null, warnings: [] },
+      { ok: false, created: false, reason: "boom", warnings: [] },
     ]);
   });
 
@@ -137,7 +163,7 @@ describe("eppWriteBundle", () => {
     );
     const writes = await window.eppWriteBundle("tok", "1", [{}, {}]);
     expect(writes).toHaveLength(2);
-    expect(writes[0]).toEqual({ ok: false, reason: 'HTTP 403: {"detail":"nope"}', warnings: [] });
+    expect(writes[0]).toEqual({ ok: false, created: false, reason: 'HTTP 403: {"detail":"nope"}', warnings: [] });
     expect(writes[1]).toEqual(writes[0]);
   });
 
@@ -146,8 +172,8 @@ describe("eppWriteBundle", () => {
     global.fetch = jest.fn(() => Promise.reject(new TypeError("Failed to fetch")));
     const writes = await window.eppWriteBundle("tok", "1", [{}, {}]);
     expect(writes).toEqual([
-      { ok: false, reason: "network error: Failed to fetch", warnings: [] },
-      { ok: false, reason: "network error: Failed to fetch", warnings: [] },
+      { ok: false, created: false, reason: "network error: Failed to fetch", warnings: [] },
+      { ok: false, created: false, reason: "network error: Failed to fetch", warnings: [] },
     ]);
 
     // Same for a truncated 200 body (response.json() rejects).
@@ -164,7 +190,7 @@ describe("eppPullResourceType", () => {
   test("writes each matching resource and counts them", async () => {
     const client = fakeClient([{ resourceType: "Condition" }, { resourceType: "Condition" }]);
     const r = await window.eppPullResourceType(client, "tok", "1", CONDITION_PULL, "iss");
-    expect(r).toEqual({ written: 2, failed: 0, error: null, reasons: {}, warnings: {} });
+    expect(r).toEqual({ created: 2, updated: 0, failed: 0, error: null, reasons: {}, warnings: {} });
     // Batched: both records travel in ONE Bundle POST, not one round trip per record.
     expect(global.fetch).toHaveBeenCalledTimes(1);
     const posted = JSON.parse(global.fetch.mock.calls[0][1].body);
@@ -172,16 +198,33 @@ describe("eppPullResourceType", () => {
     expect(posted.entry).toHaveLength(2);
   });
 
+  test("counts 201 entries as new and 200 entries as existing (a reconnect)", async () => {
+    global.fetch = jest.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            resourceType: "Bundle",
+            type: "batch-response",
+            entry: [{ response: { status: "201 Created" } }, { response: { status: "200 OK" } }, { response: { status: "200 OK" } }],
+          }),
+      }),
+    );
+    const client = fakeClient([{ resourceType: "Condition" }, { resourceType: "Condition" }, { resourceType: "Condition" }]);
+    const r = await window.eppPullResourceType(client, "tok", "1", CONDITION_PULL, "iss");
+    expect(r).toEqual({ created: 1, updated: 2, failed: 0, error: null, reasons: {}, warnings: {} });
+  });
+
   test("skips resources of a different type", async () => {
     const client = fakeClient([{ resourceType: "Condition" }, { resourceType: "Observation" }]);
     const r = await window.eppPullResourceType(client, "tok", "1", CONDITION_PULL, "iss");
-    expect(r.written).toBe(1);
+    expect(r.created).toBe(1);
   });
 
   test("a pull failure is isolated, not thrown", async () => {
     const client = { patient: { id: "epic-1", request: jest.fn(() => Promise.reject(new Error("timeout"))) } };
     const r = await window.eppPullResourceType(client, "tok", "1", CONDITION_PULL, "iss");
-    expect(r).toEqual({ written: 0, failed: 0, error: "timeout", reasons: {}, warnings: {} });
+    expect(r).toEqual({ created: 0, updated: 0, failed: 0, error: "timeout", reasons: {}, warnings: {} });
   });
 
   test("a per-entry import error counts as failed and aggregates the distinct reason", async () => {
@@ -189,7 +232,8 @@ describe("eppPullResourceType", () => {
     const client = fakeClient([{ resourceType: "Condition" }, { resourceType: "Condition" }]);
     const r = await window.eppPullResourceType(client, "tok", "1", CONDITION_PULL, "iss");
     expect(r).toEqual({
-      written: 0,
+      created: 0,
+      updated: 0,
       failed: 2,
       error: null,
       reasons: { "clinicalStatus: field required": 2 },
@@ -207,7 +251,8 @@ describe("eppPullResourceType", () => {
     const client = fakeClient([{ resourceType: "Condition" }, { resourceType: "Condition" }]);
     const r = await window.eppPullResourceType(client, "tok", "1", CONDITION_PULL, "iss");
     expect(r).toEqual({
-      written: 2,
+      created: 2,
+      updated: 0,
       failed: 0,
       error: null,
       reasons: {},
@@ -230,19 +275,19 @@ describe("eppPullResourceType", () => {
     // Second pull returns the same record: retried, succeeds, and only then is it seen.
     global.fetch = batchFetchMock("201 Created");
     r = await window.eppPullResourceType(fakeClient([obs]), "tok", "1", vitals, "iss", seen);
-    expect(r.written).toBe(1);
+    expect(r.created).toBe(1);
     expect(seen.has("obs-1")).toBe(true);
 
     // Third pull: now deduplicated.
     r = await window.eppPullResourceType(fakeClient([obs]), "tok", "1", labs, "iss", seen);
-    expect(r.written).toBe(0);
+    expect(r.created).toBe(0);
   });
 
   test("single read uses a plain instance read (not a patient-compartment search)", async () => {
     const client = fakeClient({ resourceType: "Patient", id: "epic-1" });
     const pull = { label: "Demographics", type: "Patient", query: "Patient", single: true };
     const r = await window.eppPullResourceType(client, "tok", "1", pull, "iss");
-    expect(r.written).toBe(1);
+    expect(r.created).toBe(1);
     expect(client.request).toHaveBeenCalledWith("Patient/epic-1");
     expect(client.patient.request).not.toHaveBeenCalled();
   });
@@ -264,17 +309,17 @@ describe("eppSavePatientIdentifier", () => {
 
 describe("finishEhrPatientPortalConnect", () => {
   const PICKED = "https://mercy.example.org/FHIR/R4";
-  // A configured default that is NOT the hospital the patient picked; provenance must
-  // never fall back to it, otherwise multi-hospital records are labelled with the wrong iss.
-  const CONFIG = { iss: "https://seeded-default.example.org/FHIR/R4", dataSourceId: 3 };
+  const CONFIG = { dataSourceIds: [3] };
 
   function jsonOk(body) {
     return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
   }
 
   beforeEach(() => {
-    sessionStorage.setItem("ehr_patient_portal_jhe_access_token", "tok");
+    window.storeToken("tok");
     sessionStorage.removeItem("ehr_patient_portal_brand_location_id");
+    sessionStorage.removeItem("ehr_patient_portal_source_id");
+    window.eppStoreAcceptedScopes(window.EHR_PATIENT_PORTAL_PULLS.map((pull) => pull.scope));
     // No records to pull, so the run stops after identifier + FhirSource registration.
     const client = {
       state: { serverUrl: PICKED },
@@ -294,7 +339,7 @@ describe("finishEhrPatientPortalConnect", () => {
     await window.finishEhrPatientPortalConnect(out, CONFIG);
 
     const source = global.fetch.mock.calls.find(([url]) => String(url).includes("fhir_sources"));
-    expect(JSON.parse(source[1].body).ehr_brand_location).toBe(4242);
+    expect(JSON.parse(source[1].body)).toEqual({ data_source: 3, ehr_base_url: PICKED, ehr_brand_location: 4242 });
   });
 
   test("omits the location when the patient did not come through the picker", async () => {
@@ -306,7 +351,7 @@ describe("finishEhrPatientPortalConnect", () => {
     expect(JSON.parse(source[1].body)).not.toHaveProperty("ehr_brand_location");
   });
 
-  test("stamps the authorized server URL - not the configured default - on the identifier and source label", async () => {
+  test("stamps the authorized server URL on the identifier and sends no source label", async () => {
     const out = { textContent: "" };
 
     await window.finishEhrPatientPortalConnect(out, CONFIG);
@@ -316,12 +361,19 @@ describe("finishEhrPatientPortalConnect", () => {
     const source = calls.find(([url]) => String(url).includes("fhir_sources"));
 
     expect(JSON.parse(identifier[1].body).system).toBe(PICKED);
-    // A FhirSource holds no endpoint; the label is its only human-facing handle, so the
-    // authorized server URL goes there.
-    const sourceBody = JSON.parse(source[1].body);
-    expect(sourceBody.fhir_base_url).toBeUndefined();
-    expect(sourceBody.label).toContain(PICKED);
-    expect(JSON.stringify(calls)).not.toContain(CONFIG.iss);
+    // The server names the source from the brand it resolves, so no label is sent;
+    // ehr_base_url is only a lookup hint for the server to find the brand.
+    expect(JSON.parse(source[1].body)).toEqual({ data_source: 3, ehr_base_url: PICKED });
+  });
+
+  test("registers the data source the patient chose to connect", async () => {
+    window.eppStoreSourceId(6);
+    const out = { textContent: "" };
+
+    await window.finishEhrPatientPortalConnect(out, CONFIG);
+
+    const source = global.fetch.mock.calls.find(([url]) => String(url).includes("fhir_sources"));
+    expect(JSON.parse(source[1].body).data_source).toBe(6);
   });
 
   test("stops with an error when the authorization carries no server URL", async () => {
@@ -332,5 +384,51 @@ describe("finishEhrPatientPortalConnect", () => {
 
     expect(out.textContent).toContain("no FHIR server URL");
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("eppCallback", () => {
+  const TEMPLATES = path.resolve(__dirname, "../../../core/templates");
+
+  // A Django component file is a {% verbatim %}-wrapped <script type="text/template">; strip the tags to get the HTML.
+  function componentHtml(file) {
+    return fs.readFileSync(file, "utf8").replace(/{% ?verbatim ?%}|{% ?endverbatim ?%}/g, "");
+  }
+
+  beforeEach(() => {
+    document.body.innerHTML =
+      `<div id="pf_main"></div>` +
+      ["common/patient_facing/components/importing.html", "common/patient_facing/components/rail.html", "common/patient_facing/components/error.html"]
+        .map((file) => componentHtml(path.join(TEMPLATES, file)))
+        .join("");
+    global.PATIENT_FACING_CONFIG = { dataSourceIds: [5], pageUrl: "/clients/ehr-patient-portal/", siteTitle: "T", expectedResourceTypes: [] };
+    window.storeToken("tok");
+    sessionStorage.removeItem("ehr_patient_portal_source_id");
+    // Accept every scope so the pull loop below actually attempts every type (real flow: set by the scope picker).
+    window.eppStoreAcceptedScopes(window.EHR_PATIENT_PORTAL_PULLS.map((pull) => pull.scope));
+  });
+
+  test("a failed Epic handshake ends on the callout, with a retry that restarts the picker", async () => {
+    global.FHIR = { oauth2: { ready: jest.fn(() => Promise.reject(new Error("state parameter not found"))) } };
+
+    await window.eppCallback();
+
+    expect(document.querySelector(".pf-error__title").textContent).toBe("We couldn't reach your healthcare organization");
+    expect(document.querySelector("#pf_main .pf-btn").getAttribute("href")).toBe("/clients/ehr-patient-portal/?route=connect&source=5");
+  });
+
+  test("a run where every record type failed to fetch ends on the callout", async () => {
+    const refuse = jest.fn(() => Promise.reject(new Error("HTTP 403")));
+    global.FHIR = {
+      oauth2: { ready: jest.fn(() => Promise.resolve({ state: { serverUrl: "https://mercy.example.org/FHIR/R4" }, patient: { id: "epic-1", request: refuse }, request: refuse })) },
+    };
+    global.fetch = jest.fn((url) =>
+      Promise.resolve({ ok: true, json: () => Promise.resolve(String(url).includes("fhir_sources") ? { id: 9 } : {}) }),
+    );
+
+    await window.eppCallback();
+
+    expect(document.querySelector(".pf-error__title").textContent).toBe("We couldn't reach your healthcare organization");
+    expect(document.querySelector(".pf-error__msg").textContent).toBe("none of your record types could be fetched");
   });
 });

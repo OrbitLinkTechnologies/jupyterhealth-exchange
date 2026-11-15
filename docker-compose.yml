@@ -28,6 +28,8 @@ services:
     command: ["python", "manage.py", "migrate", "--noinput"]
 
   jhe:
+    ports:
+      - "8000:8000"
     build:
       context: .
       dockerfile: Dockerfile
@@ -53,6 +55,8 @@ services:
     command: ["supercronic", "/code/deploy/crontab"]
 
   jhe-mcp:
+    ports:
+      - "8401:8401"
     build:
       context: ./mcp_server
       dockerfile: Dockerfile
@@ -65,6 +69,7 @@ services:
 
   cloudflared-jhe:
     image: cloudflare/cloudflared:latest
+    profiles: ["cloudflare-tunnel"]
     restart: unless-stopped
     command: tunnel run
     environment:
@@ -74,6 +79,7 @@ services:
 
   cloudflared-mcp:
     image: cloudflare/cloudflared:latest
+    profiles: ["cloudflare-tunnel"]
     restart: unless-stopped
     command: tunnel run
     environment:

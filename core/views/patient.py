@@ -15,7 +15,9 @@ from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 
 from core.models import (
+    OW_USER_ID_SYSTEM,
     CodeableConcept,
+    FhirSource,
     JheUser,
     Observation,
     Organization,
@@ -33,6 +35,7 @@ from core.permissions import IfUserCan
 from core.serializers import (
     ClientSerializer,
     CodeableConceptSerializer,
+    PatientFhirSourceSerializer,
     PatientInvitationSerializer,
     PatientSerializer,
     StudyConsentsSerializer,
@@ -174,11 +177,17 @@ class PatientViewSet(ModelViewSet):
 
     @staticmethod
     def _replace_patient_identifiers(patient, identifiers):
-        PatientIdentifier.objects.filter(patient=patient).delete()
+        """Replace the patient's identifiers with the given list, leaving the Open Wearables link alone.
+
+        Only POST /api/v1/ow/users writes the OW link, from OW's own answer: a typed-in value could
+        point at another patient's OW user, and a form opened before the patient linked OW would
+        otherwise unlink them on save.
+        """
+        PatientIdentifier.objects.filter(patient=patient).exclude(system=OW_USER_ID_SYSTEM).delete()
         for item in identifiers:
             system = item.get("system")
             value = item.get("value")
-            if system is None or value is None:
+            if system is None or value is None or system == OW_USER_ID_SYSTEM:
                 continue
             PatientIdentifier.objects.create(patient=patient, system=system, value=value)
 
@@ -255,6 +264,16 @@ class PatientViewSet(ModelViewSet):
 
         return Response(data)
 
+    @action(detail=True, methods=["GET"], url_path="fhir_sources")
+    def fhir_sources(self, request, pk):
+        """GET /api/v1/patients/{id}/fhir_sources - the patient's FhirSources, for the admin patient page.
+
+        Lists one patient's sources with their data source name, shaped for the admin patient page; FhirSourceViewSet lists every source a practitioner can see, across patients. get_object() applies the same access rule as the patient detail it sits beside.
+        """
+        patient = self.get_object()
+        sources = FhirSource.objects.filter(patient=patient).select_related("data_source").order_by("id")
+        return Response(PatientFhirSourceSerializer(sources, many=True).data)
+
     @action(detail=False, methods=["GET"])
     def me(self, request):
         """GET /api/v1/patients/me - Returns the authenticated patient's data."""
@@ -269,11 +288,10 @@ class PatientViewSet(ModelViewSet):
         if (not request.user.is_practitioner()) and (int(pk) != request.user.get_patient().id):
             raise PermissionDenied("The Patient does not match the current patient user.")
         patient = self.get_object()
-        jhe_user = patient.jhe_user
-        if not jhe_user.identifier or not jhe_user.identifier.startswith("ow:"):
+        ow_user_id = patient.get_ow_user_id()
+        if not ow_user_id:
             return Response({"connections": [], "connected": False})
 
-        ow_user_id = jhe_user.identifier.removeprefix("ow:")
         ow_api_url = get_setting("ow.api_url", "")
         ow_api_key = get_setting("ow.api_key", "")
         if not ow_api_url or not ow_api_key:
@@ -368,14 +386,12 @@ class PatientViewSet(ModelViewSet):
                     ).id
 
                     if request.method == "POST":
-                        responses.append(
-                            StudyPatientScopeConsent.objects.create(
-                                study_patient_id=study_patient.id,
-                                scope_code_id=scope_code_id,
-                                consented=scope_consent["consented"],
-                                consented_time=consented_time,
-                            )
+                        spsc, _ = StudyPatientScopeConsent.objects.update_or_create(
+                            study_patient_id=study_patient.id,
+                            scope_code_id=scope_code_id,
+                            defaults={"consented": scope_consent["consented"], "consented_time": consented_time},
                         )
+                        responses.append(spsc)
                     elif request.method == "PATCH":
                         spsc = StudyPatientScopeConsent.objects.get(
                             study_patient_id=study_patient.id,
@@ -412,8 +428,8 @@ class PatientViewSet(ModelViewSet):
         now consented=false. If so, revoke the OW vendor connection (best-effort).
         """
         logger = logging.getLogger(__name__)
-        jhe_user = patient.jhe_user
-        if not jhe_user.identifier or not jhe_user.identifier.startswith("ow:"):
+        ow_user_id = patient.get_ow_user_id()
+        if not ow_user_id:
             return
 
         for entry in study_scope_consents:
@@ -429,7 +445,6 @@ class PatientViewSet(ModelViewSet):
                 continue
 
             # All scopes revoked for this study - disconnect OW vendor connection
-            ow_user_id = jhe_user.identifier.removeprefix("ow:")
             ow_api_url = get_setting("ow.api_url", "")
             ow_api_key = get_setting("ow.api_key", "")
             if not ow_api_url or not ow_api_key:

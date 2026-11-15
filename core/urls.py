@@ -46,6 +46,7 @@ api_router.register(r"patients", views.PatientViewSet, basename="Patient")
 api_router.register(r"studies", views.StudyViewSet, basename="Study")
 api_router.register(r"observations", views.ObservationViewSet, basename="Observation")
 api_router.register(r"data_sources", views.DataSourceViewSet, basename="DataSource")
+api_router.register(r"ehr_vendors", views.EhrVendorViewSet, basename="EhrVendor")
 api_router.register(r"clients", views.ClientViewSet, basename="Client")
 api_router.register(r"fhir_sources", views.FhirSourceViewSet, basename="FhirSource")
 api_router.register(r"invitation", views.PatientInvitationViewSet, basename="PatientInvitation")
@@ -64,9 +65,6 @@ urlpatterns = [
     path(".well-known/assetlinks.json", common.assetlinks, name="assetlinks"),
     # Home
     path("", common.home, name="home"),
-    # OW Portal
-    path("clients/ow/", common.ow_client, name="ow_client"),
-    path("clients/ow/complete", common.ow_client_complete, name="ow_client_complete"),
     # Django auth and accounts
     path("accounts/login/", common.LoginView.as_view(), name="login"),
     path("accounts/login-otp/", common.request_login_otp, name="login-otp"),
@@ -96,9 +94,10 @@ urlpatterns = [
     # oauth token exchange
     path(f"{settings.OAUTH_MOUNT_PATH.lstrip('/')}token-exchange", common.token_exchange, name="token-exchange"),
     # OW Client pages
+    path("clients/ow/", common.ow_launch, name="ow_client"),
+    path("clients/ow/complete", common.ow_complete, name="ow_client_complete"),
     path("clients/ow/launch", common.ow_launch, name="ow-launch"),
     path("clients/ow/complete", common.ow_complete, name="ow-complete"),
-    path("clients/ow/manage", common.ow_manage, name="ow-manage"),
     # EHR Patient Portal patient EHR-records client (issue #489). The two page paths are
     # registered as redirect URIs on the Epic app -- changing them requires the Epic-side
     # registration to be updated in step. The api/v1 pair below is JHE's own and is not

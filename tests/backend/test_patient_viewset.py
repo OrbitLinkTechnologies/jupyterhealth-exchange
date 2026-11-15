@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
 from django.db import connection
 from django.db.utils import IntegrityError
@@ -5,6 +7,8 @@ from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIClient
 
 from core.models import (
+    OW_USER_ID_SYSTEM,
+    FhirSource,
     Organization,
     Patient,
     PatientIdentifier,
@@ -91,6 +95,34 @@ def test_consent_post_stores_timezone_aware_time(hr_study, recwarn):
     assert response.status_code == 201, response.text
     naive = [w for w in recwarn.list if issubclass(w.category, RuntimeWarning) and "naive datetime" in str(w.message)]
     assert not naive, [str(w.message) for w in naive]
+
+
+def test_consent_post_updates_an_existing_consent(patient, hr_study):
+    """The patient already consented to heart rate in hr_study; a second POST must update that row, not error."""
+    client = APIClient()
+    client.force_authenticate(patient.jhe_user)
+    payload = {
+        "study_scope_consents": [
+            {
+                "study_id": hr_study.id,
+                "scope_consents": [
+                    {
+                        "coding_system": Code.OpenMHealth.value,
+                        "coding_code": Code.HeartRate.value,
+                        "consented": False,
+                    }
+                ],
+            }
+        ]
+    }
+    response = client.post(f"/api/v1/patients/{patient.id}/consents", data=payload, format="json")
+    assert response.status_code == 201, response.text
+    assert response.json()["studyScopeConsents"][0]["consented"] is False
+    consent = StudyPatientScopeConsent.objects.get(
+        study_patient__patient=patient,
+        scope_code__coding_code=Code.HeartRate.value,
+    )
+    assert consent.consented is False
 
 
 def test_list_patients_pagination_is_ordered(api_client, organization, recwarn):
@@ -399,3 +431,74 @@ def test_update_replaces_identifiers(api_client, organization):
     assert len(data["identifiers"]) == 2
     systems = {i["system"] for i in data["identifiers"]}
     assert systems == {"http://hospital-b.org", "http://hospital-c.org"}
+
+
+def test_patient_fhir_sources_lists_the_patients_sources_for_a_practitioner(api_client, patient, device):
+    mine = FhirSource.objects.create(patient=patient, data_source=device, label="Epic / Mercy")
+    other_patient = add_patients(1, organization=patient.organizations.first())[0]
+    FhirSource.objects.create(patient=other_patient, data_source=device, label="Someone else's")
+
+    r = api_client.get(f"/api/v1/patients/{patient.id}/fhir_sources")
+
+    assert r.status_code == 200, r.text
+    rows = r.json()
+    assert [row["id"] for row in rows] == [mine.id]
+    assert rows[0]["dataSourceName"] == device.name
+    assert rows[0]["label"] == "Epic / Mercy"
+    assert rows[0]["lastUpdated"]
+
+
+def test_patient_fhir_sources_is_empty_without_sources(api_client, patient):
+    assert api_client.get(f"/api/v1/patients/{patient.id}/fhir_sources").json() == []
+
+
+def test_patient_fhir_sources_is_denied_to_another_patient(patient, device):
+    FhirSource.objects.create(patient=patient, data_source=device, label="Epic")
+    other = add_patients(1, organization=patient.organizations.first())[0]
+    client = APIClient()
+    client.force_authenticate(other.jhe_user)
+
+    assert client.get(f"/api/v1/patients/{patient.id}/fhir_sources").status_code == 403
+
+
+def _ow_setting(key, default=None):
+    return {"ow.api_url": "http://ow.test", "ow.api_key": "key"}.get(key, default)
+
+
+@patch("requests.get")
+@patch("core.views.patient.get_setting", side_effect=_ow_setting)
+def test_wearable_status_asks_ow_about_the_linked_user(_get_setting, mock_get, patient):
+    PatientIdentifier.objects.create(patient=patient, system=OW_USER_ID_SYSTEM, value="abc")
+    mock_get.return_value = MagicMock(status_code=200)
+    mock_get.return_value.json.return_value = [{"provider": "oura"}]
+    client = APIClient()
+    client.force_authenticate(patient.jhe_user)
+
+    response = client.get(f"/api/v1/patients/{patient.id}/wearable-status")
+
+    assert response.json() == {"connections": [{"provider": "oura"}], "connected": True}
+    assert mock_get.call_args[0][0] == "http://ow.test/api/v1/users/abc/connections"
+
+
+def test_patient_form_save_keeps_the_ow_link(api_client, organization, patient):
+    """A form opened before the patient linked OW must not unlink them on save."""
+    PatientIdentifier.objects.create(patient=patient, system=OW_USER_ID_SYSTEM, value="abc")
+
+    r = api_client.patch(
+        f"/api/v1/patients/{patient.id}?organizationId={organization.id}", {"identifiers": []}, format="json"
+    )
+
+    assert r.status_code == 200, r.text
+    assert patient.get_ow_user_id() == "abc"
+
+
+def test_patient_form_cannot_write_an_ow_link(api_client, organization, patient):
+    """Only connecting OW sets the link; a typed-in value could point at another patient's OW user."""
+    r = api_client.patch(
+        f"/api/v1/patients/{patient.id}?organizationId={organization.id}",
+        {"identifiers": [{"system": OW_USER_ID_SYSTEM, "value": "someone-elses-uuid"}]},
+        format="json",
+    )
+
+    assert r.status_code == 200, r.text
+    assert patient.get_ow_user_id() is None

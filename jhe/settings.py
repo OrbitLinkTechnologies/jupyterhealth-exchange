@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from django.core.management.utils import get_random_secret_key
 from dotenv import load_dotenv
 
-JHE_VERSION = "v0.0.13"
+JHE_VERSION = "v0.0.14"
 
 """
 Django settings for jhe project.
@@ -145,7 +145,11 @@ REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     # 'DEFAULT_PAGINATION_CLASS': 'core.pagination.CustomPageNumberPagination',
     "PAGE_SIZE": 1000,
-    "DEFAULT_AUTHENTICATION_CLASSES": ("core.auth.JheOAuth2Authentication",),
+    # User resolution for client-credentials tokens lives in the shared
+    # OAUTH2_VALIDATOR_CLASS (core.auth.JheOAuth2Validator) below, not here, so
+    # every bearer-token consumer -- this DRF class, /o/userinfo/, /o/introspect/
+    # -- gets it for free instead of needing its own wrapper.
+    "DEFAULT_AUTHENTICATION_CLASSES": ("oauth2_provider.contrib.rest_framework.OAuth2Authentication",),
     "DEFAULT_RENDERER_CLASSES": (
         "djangorestframework_camel_case.render.CamelCaseJSONRenderer",
         "djangorestframework_camel_case.render.CamelCaseBrowsableAPIRenderer",
@@ -277,7 +281,7 @@ OAUTH2_PROVIDER_APPLICATION_MODEL = "oauth2_provider.Application"
 # JheSettings, not env vars — see the `auth.sof.*` keys seeded in
 # core/management/commands/seed.py and https://jupyterhealth.github.io/software-documentation/jhe/provider-ehr-launch :
 #   auth.sof.trusted_issuers  (json array) — trusted EHR OIDC issuers (id_token `iss`)
-#   auth.sof.trusted_audience (string)     — the SMART app's client_id at the EHR (id_token `aud`)
+#   auth.sof.trusted_audience (json array)     — the SMART apps' client_id at the EHR (id_token `aud`)
 
 X_FRAME_OPTIONS = os.getenv("X_FRAME_OPTIONS", "SAMEORIGIN")
 

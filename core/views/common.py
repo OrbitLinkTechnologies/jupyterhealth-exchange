@@ -23,8 +23,9 @@ from oauth2_provider.views import TokenView
 from oauthlib.common import Request
 
 from core.auth import IdTokenError, JheOAuth2Validator, account_activation_token, parse_fhir_user, verify_id_token
-from core.models import JheUser
+from core.models import Practitioner
 from core.services.jhe_settings import get_setting
+from core.views.patient_facing import patient_facing_config
 
 from ..forms import UserRegistrationForm
 
@@ -57,14 +58,6 @@ def assetlinks(request):
 
 def home(request):
     return render(request, "home/home.html")
-
-
-def ow_client(request):
-    return render(request, "clients/ow/launch.html")
-
-
-def ow_client_complete(request):
-    return render(request, "clients/ow/complete.html")
 
 
 class LoginView(BaseLoginView):
@@ -221,15 +214,17 @@ def portal(request, path):
 
 
 def ow_launch(request):
-    return render(request, "clients/ow/launch.html")
+    config = patient_facing_config("Open Wearables", "ow", reverse("ow-launch"))
+    return render(request, "clients/ow/launch.html", {"config": config})
 
 
 def ow_complete(request):
-    return render(request, "clients/ow/complete.html")
-
-
-def ow_manage(request):
-    return render(request, "clients/ow/manage.html")
+    """Open Wearables OAuth return: the client page shows the done screen, or the error callout on ?error=."""
+    error = request.GET.get("error")
+    if error:
+        query = urlencode({"route": "error", "title": "We couldn't connect your wearable", "message": error})
+        return redirect(reverse("ow-launch") + "?" + query)
+    return redirect(reverse("ow-launch") + "?route=done")
 
 
 def json_error(msg, status_code=400):
@@ -270,7 +265,9 @@ def token_exchange(request: HttpRequest):
 
     The id_token is verified offline against the EHR's JWKS (cross-vendor, relies
     only on ONC g(10) capabilities). The provider is identified by the fhirUser
-    claim and mapped to a JHE Practitioner.
+    claim and mapped to a JHE Practitioner through a PractitionerIdentifier whose
+    system is the token's issuer, so an id asserted by one EHR never matches a row
+    registered for another.
     Ref: https://datatracker.ietf.org/doc/html/rfc8693
     """
     _id_token_type = "urn:ietf:params:oauth:token-type:id_token"
@@ -320,6 +317,9 @@ def token_exchange(request: HttpRequest):
     expected_audience = get_setting("auth.sof.trusted_audience", None)
     if not trusted_issuers or not expected_audience:
         return json_error("Token exchange is not configured.", status_code=500)
+    if isinstance(expected_audience, str):
+        # backward-compat: previously single string setting
+        expected_audience = [expected_audience]
 
     # Derive the issuer from the token's own `iss` so the exact value -- including
     # any trailing slash (e.g. MedPlum's) -- is what we verify against.
@@ -344,17 +344,20 @@ def token_exchange(request: HttpRequest):
     if resource_type != "Practitioner":
         return json_error("fhirUser is not a Practitioner", status_code=403)
 
-    # Bare fhirUser id (not an issuer-scoped composite): each JHE instance trusts
-    # exactly one EHR, so no other issuer can assert these Practitioner ids.
+    issuer = token_issuer.rstrip("/")
     try:
-        user = JheUser.objects.get(identifier=identifier)
-    except JheUser.DoesNotExist:
+        practitioner = (
+            Practitioner.objects.select_related("jhe_user")
+            .filter(identifiers__system__in=(issuer, f"{issuer}/"), identifiers__value=identifier)
+            .distinct()
+            .get()
+        )
+    except Practitioner.DoesNotExist:
         return json_error("Practitioner not found", status_code=404)
-    except JheUser.MultipleObjectsReturned:
-        logger.error("Multiple JheUsers share identifier %r", identifier)
+    except Practitioner.MultipleObjectsReturned:
+        logger.error("Multiple practitioners hold identifier %r from issuer %s", identifier, token_issuer)
         return json_error("Practitioner not found", status_code=404)
-    if not user.practitioner:
-        return json_error("User is not a Practitioner", status_code=403)
+    user = practitioner.jhe_user
 
     # Issue a JHE access token, linked to the authenticated client (oauth_request.client
     # was set by authenticate_client above) and bound to the resolved Practitioner.

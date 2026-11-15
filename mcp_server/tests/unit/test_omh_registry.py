@@ -2,7 +2,16 @@ import re
 from pathlib import Path
 
 import pytest
-from jhe_mcp.omh_registry import all_schema_ids, all_short_names, load_schema, lookup_code, short_name
+from jhe_mcp.omh_registry import (
+    all_schema_ids,
+    all_short_names,
+    candidate_codes,
+    known_data_types,
+    load_schema,
+    lookup_code,
+    schema_ids_for,
+    short_name,
+)
 
 # JHE's seed command, relative to this test: tests/unit -> tests -> mcp_server
 # -> <repo root>. Present in any monorepo checkout (incl. CI, which checks out
@@ -55,7 +64,7 @@ def test_short_name_extraction():
     assert short_name("omh:heart-rate:2.0") == "heart-rate"
     assert short_name("omh:blood-pressure:4.0") == "blood-pressure"
     assert short_name("ieee:sleep-stage-summary:1.0") == "sleep-stage-summary"
-    assert short_name("local:heart-rate-variability:1.0") == "heart-rate-variability"
+    assert short_name("ieee:total-sleep-time:1.0") == "total-sleep-time"
 
 
 def test_lookup_code_known():
@@ -73,12 +82,54 @@ def test_lookup_code_unknown():
     assert lookup_code("nonexistent") is None
 
 
+@pytest.mark.parametrize(
+    ("name", "ieee_id", "omh_id"),
+    [
+        ("sleep-episode", "ieee:sleep-episode:1.0", "omh:sleep-episode:1.1"),
+        ("physical-activity", "ieee:physical-activity:1.0", "omh:physical-activity:1.2"),
+    ],
+)
+def test_ambiguous_short_name_is_ieee_first_and_never_comma_joined(name, ieee_id, omh_id):
+    """A short name served by both IEEE and OMH lists both candidates IEEE-first; lookup_code picks one."""
+    assert schema_ids_for(name) == [ieee_id, omh_id]
+    assert candidate_codes(name) == [
+        f"https://w3id.org/ieee1752|{ieee_id}",
+        f"https://w3id.org/openmhealth|{omh_id}",
+    ]
+    assert lookup_code(name) == f"https://w3id.org/ieee1752|{ieee_id}"  # the probe picks one system, not both
+
+
+def test_full_schema_id_resolves_to_exactly_that_code():
+    assert schema_ids_for("omh:sleep-episode:1.1") == ["omh:sleep-episode:1.1"]
+    assert candidate_codes("omh:sleep-episode:1.1") == ["https://w3id.org/openmhealth|omh:sleep-episode:1.1"]
+    assert lookup_code("omh:sleep-episode:1.1") == "https://w3id.org/openmhealth|omh:sleep-episode:1.1"
+    assert lookup_code("ieee:sleep-episode:1.0") == "https://w3id.org/ieee1752|ieee:sleep-episode:1.0"
+
+
+def test_unknown_full_schema_id():
+    assert schema_ids_for("omh:sleep-episode:9.9") == []
+    assert candidate_codes("omh:sleep-episode:9.9") == []
+    assert lookup_code("omh:sleep-episode:9.9") is None
+
+
+def test_known_data_types_lists_full_ids_of_ambiguous_names():
+    known = known_data_types()
+    assert known[: len(all_short_names())] == all_short_names()
+    assert "ieee:sleep-episode:1.0" in known and "omh:sleep-episode:1.1" in known
+    assert "omh:heart-rate:2.0" not in known  # unambiguous names are listed by short name only
+
+
+def test_schema_ids_for_unknown():
+    assert schema_ids_for("nonexistent") == []
+
+
 def test_all_short_names():
     names = all_short_names()
     assert "heart-rate" in names
     assert "blood-pressure" in names
     assert "blood-glucose" in names
     assert sorted(names) == names
+    assert len(names) == len(set(names))  # ambiguous names listed once
 
 
 def test_load_schema_wearable():

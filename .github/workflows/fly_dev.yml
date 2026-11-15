@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       checks: read
+      actions: read
     steps:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -44,7 +45,18 @@ jobs:
                     break;
                 }
                 const suiteId = thisRun[0].check_suite.id;
-                const others = jobs.filter(j => j.check_suite.id !== suiteId);
+                // Dependabot security-update jobs are Actions runs with event "dynamic" that
+                // attach to whatever commit is main's head when they fire, report "update not
+                // needed" as a failure, and cannot be re-run. They are not CI; skip their suites.
+                const dynamicSuites = new Set();
+                for (const id of new Set(jobs.map(j => j.check_suite.id))) {
+                    if (id === suiteId) continue;
+                    const runs = await github.rest.actions.listWorkflowRunsForRepo(
+                        { ...context.repo, check_suite_id: id, per_page: 1 }
+                    );
+                    if (runs.data.workflow_runs.some(r => r.event === 'dynamic')) dynamicSuites.add(id);
+                }
+                const others = jobs.filter(j => j.check_suite.id !== suiteId && !dynamicSuites.has(j.check_suite.id));
 
                 const completed = others.filter(j => j.status === 'completed');
                 const failed = completed.filter(j => j.conclusion !== 'success' && j.conclusion !== 'skipped');
@@ -72,6 +84,26 @@ jobs:
     - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
     - name: Deploy
       run: flyctl deploy -a jhe --remote-only --dockerfile ./Dockerfile
+
+  deploy-mcp:
+    name: Jhe MCP app
+    needs: gate
+    runs-on: ubuntu-latest
+    env:
+      # FLY_API_TOKEN is scoped to the jhe app; jhe-mcp has its own deploy token.
+      FLY_API_TOKEN: ${{ secrets.FLY_MCP_API_TOKEN }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+    - name: Deploy
+      # mcp_server/fly.toml names the app and Dockerfile.
+      working-directory: mcp_server
+      run: flyctl deploy --remote-only
+    - name: Health check
+      # min_machines_running is 0, so the first request cold-starts the machine.
+      run: curl --fail --silent --show-error --retry 6 --retry-delay 5 --retry-all-errors https://jhe-mcp.fly.dev/health
 
   smoke-test:
     name: Post-deploy smoke tests

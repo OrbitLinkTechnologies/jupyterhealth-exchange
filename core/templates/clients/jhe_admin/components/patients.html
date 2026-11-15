@@ -345,6 +345,7 @@
               {{#if read}}
                 <div class="mb-3">
                   Consolidated Clients:
+                  <div class="text-muted small">(Mouse over date for full timestamp)</div>
                   <ul>
                   {{#consolidatedClients}}
                     <li>
@@ -353,7 +354,7 @@
                         <ul class="mb-3">
                            {{#each patientInvitations}}
                             <li>
-                              <span class="badge text-bg-light">{{lastUpdated}}</span> &rarr; {{status}}
+                              <span class="badge text-bg-light" title="{{lastUpdatedFull}}">{{lastUpdated}}</span> &rarr; {{status}}
                               {{#if (eq status "Redeemed")}}
                                 <i class="bi bi-check-circle-fill"></i>
                               {{/if}}
@@ -431,6 +432,17 @@
                       </ul>
                     </li>
                   {{/studiesConsented}}
+                  </ul>
+                </div>
+                <div class="mb-3">
+                  FHIR Sources:
+                  <p class="text-muted small mb-0">(Mouse over for last updated time)</p>
+                  <ul>
+                  {{#fhirSources}}
+                    <li>
+                      <span title="{{lastUpdated}}">{{dataSourceName}}</span>: <span title="{{lastUpdated}}">{{labelTruncated}}</span> (<span title="{{lastUpdated}}">{{id}}</span>)
+                    </li>
+                  {{/fhirSources}}
                   </ul>
                 </div>
               {{/if}}

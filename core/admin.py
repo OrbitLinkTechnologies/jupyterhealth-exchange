@@ -8,6 +8,7 @@ from core.models import (
     DataSourceSupportedScope,
     EhrBrand,
     EhrBrandLocation,
+    EhrVendor,
     FhirAuxResource,
     FhirSource,
     JheClient,
@@ -22,6 +23,7 @@ from core.models import (
     PatientOrganization,
     Practitioner,
     PractitionerClient,
+    PractitionerIdentifier,
     PractitionerOrganization,
     Study,
     StudyClient,
@@ -34,8 +36,8 @@ from core.models import (
 
 @admin.register(JheUser)
 class JheUserAdmin(admin.ModelAdmin):
-    list_display = ("email", "first_name", "last_name", "identifier", "is_staff", "is_active")
-    search_fields = ("email", "first_name", "last_name", "identifier")
+    list_display = ("email", "first_name", "last_name", "is_staff", "is_active")
+    search_fields = ("email", "first_name", "last_name")
     list_filter = ("is_staff", "is_active", "is_superuser")
     # The groups / user_permissions M2M tables were dropped (migration 0011), so the default
     # admin machinery crashes when it touches them. Hide the fields and route every delete path
@@ -115,8 +117,8 @@ class ProfileAdminMixin:
 
 @admin.register(Practitioner)
 class PractitionerAdmin(ProfileAdminMixin, admin.ModelAdmin):
-    list_display = ("__str__", "email", "identifier", "id")
-    search_fields = ("name_given", "name_family", "jhe_user__email")
+    list_display = ("__str__", "email", "id")
+    search_fields = ("name_given", "name_family", "jhe_user__email", "identifiers__value")
 
     @admin.display(description="Email")
     def email(self, obj):
@@ -228,6 +230,13 @@ class PatientIdentifierAdmin(admin.ModelAdmin):
     raw_id_fields = ("patient",)
 
 
+@admin.register(PractitionerIdentifier)
+class PractitionerIdentifierAdmin(admin.ModelAdmin):
+    list_display = ("id", "practitioner", "system", "value")
+    search_fields = ("system", "value", "practitioner__name_family", "practitioner__name_given")
+    raw_id_fields = ("practitioner",)
+
+
 @admin.register(PatientOrganization)
 class PatientOrganizationAdmin(admin.ModelAdmin):
     list_display = ("id", "patient", "organization")
@@ -307,11 +316,18 @@ class ClientDataSourceAdmin(admin.ModelAdmin):
     raw_id_fields = ("client", "data_source")
 
 
+@admin.register(EhrVendor)
+class EhrVendorAdmin(admin.ModelAdmin):
+    list_display = ("name", "ehr_client_id", "id")
+    search_fields = ("name",)
+
+
 @admin.register(EhrBrand)
 class EhrBrandAdmin(admin.ModelAdmin):
-    list_display = ("name", "vendor", "fhir_base_url", "npi", "id")
-    search_fields = ("name", "fhir_base_url", "npi")
+    list_display = ("name", "vendor", "fhir_base_url", "npi_type_2", "id")
+    search_fields = ("name", "fhir_base_url", "npi_type_2")
     list_filter = ("vendor",)
+    raw_id_fields = ("vendor",)
 
 
 @admin.register(EhrBrandLocation)

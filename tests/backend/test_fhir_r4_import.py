@@ -544,36 +544,93 @@ def _r4_condition(patient, resource_id, text="HTN"):
     }
 
 
-def test_reimport_of_the_same_record_is_refused_as_a_duplicate(api_client, patient, fhir_source):
-    # Re-posting a record already stored under this source is refused per entry, and the stored
-    # record is left alone. Reconnecting an EHR registers a NEW source, so a genuine reconnect
-    # never reaches this path -- it only fires when one source really is asked to hold a record twice.
-    r4 = _r4_condition(patient, "epic-cond-1")
-    first = api_client.post("/fhir-import/R4/Condition", r4, **_src(fhir_source))
+def test_reimport_of_the_same_record_overwrites_it(api_client, patient, fhir_source):
+    # Reconnecting an EHR reuses the patient's source for that brand, so a re-import posts the same
+    # record to the same source: the EHR's latest copy replaces the stored one, which keeps its JHE
+    # id. The entry says 201 for the first import and 200 for the overwrite.
+    first = api_client.post("/fhir-import/R4/Condition", _r4_condition(patient, "epic-cond-1"), **_src(fhir_source))
     again = api_client.post(
         "/fhir-import/R4/Condition", _r4_condition(patient, "epic-cond-1", "HTN (updated)"), **_src(fhir_source)
     )
     assert first.status_code == 200 and again.status_code == 200
-    assert first.json()["entry"][0]["response"]["status"].startswith("2")
-
-    response = again.json()["entry"][0]["response"]
-    assert response["status"].startswith("409")
-    issue = response["outcome"]["issue"][0]
-    assert issue["severity"] == "error" and issue["code"] == "duplicate"
+    first_entry = first.json()["entry"][0]
+    again_entry = again.json()["entry"][0]
+    assert first_entry["response"]["status"] == "201 Created"
+    assert again_entry["response"]["status"] == "200 OK", again.text
+    assert again_entry["resource"]["id"] == first_entry["resource"]["id"]
 
     rows = FhirAuxResource.objects.filter(resource_type="Condition", fhir_resource_id="epic-cond-1")
     assert rows.count() == 1
-    assert rows.get().fhir_data["code"] == {"text": "HTN"}
+    row = rows.get()
+    assert str(row.pk) == first_entry["resource"]["id"]
+    assert row.fhir_data["code"] == {"text": "HTN (updated)"}
+    # The upstream id is stamped once, not once per import.
+    stamp = {"system": fhir_source_uri(fhir_source.pk), "value": "epic-cond-1"}
+    assert row.fhir_data["identifier"].count(stamp) == 1
+
+
+def test_reimport_of_an_unchanged_record_is_not_saved_again(api_client, patient, fhir_source):
+    # An identical re-import answers 200 but leaves the row alone, so last_updated only moves when
+    # the record actually changed.
+    api_client.post("/fhir-import/R4/Condition", _r4_condition(patient, "epic-cond-1"), **_src(fhir_source))
+    row = FhirAuxResource.objects.get(resource_type="Condition", fhir_resource_id="epic-cond-1")
+    FhirAuxResource.objects.filter(pk=row.pk).update(ref_indexed=True)  # a save would reset this
+
+    again = api_client.post("/fhir-import/R4/Condition", _r4_condition(patient, "epic-cond-1"), **_src(fhir_source))
+    assert again.json()["entry"][0]["response"]["status"] == "200 OK", again.text
+    after = FhirAuxResource.objects.get(pk=row.pk)
+    assert after.last_updated == row.last_updated
+    assert after.ref_indexed is True
+
+
+def test_reimport_bundle_reports_new_and_existing_records(api_client, patient, fhir_source):
+    api_client.post("/fhir-import/R4/Condition", _r4_condition(patient, "epic-cond-1"), **_src(fhir_source))
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "batch",
+        "entry": [
+            {"resource": _r4_condition(patient, "epic-cond-1", "HTN (updated)")},
+            {"resource": _r4_condition(patient, "epic-cond-2")},
+        ],
+    }
+    response = api_client.post("/fhir-import/R4/", bundle, **_src(fhir_source))
+    statuses = [entry["response"]["status"] for entry in response.json()["entry"]]
+    assert statuses == ["200 OK", "201 Created"], response.text
+    assert FhirAuxResource.objects.filter(fhir_source=fhir_source, resource_type="Condition").count() == 2
+
+
+def test_reimport_that_loses_a_race_overwrites_the_parallel_row(api_client, patient, fhir_source, monkeypatch):
+    # Two imports of a new record at once: both find no row, and the second insert hits the
+    # uniqueness constraint. That import retries as an overwrite of the row the first one created.
+    from core.views import fhir as fhir_views
+
+    real_create = fhir_views.create_aux_resource
+    calls = []
+
+    def create_after_a_parallel_import(resource_type, data, source, upstream_id=None):
+        if not calls:
+            # The parallel import commits its row between this import's lookup and its insert.
+            real_create(resource_type, dict(data, code={"text": "parallel"}), source, upstream_id=upstream_id)
+        calls.append(upstream_id)
+        return real_create(resource_type, data, source, upstream_id=upstream_id)
+
+    monkeypatch.setattr(fhir_views, "create_aux_resource", create_after_a_parallel_import)
+    response = api_client.post(
+        "/fhir-import/R4/Condition", _r4_condition(patient, "epic-cond-1", "mine"), **_src(fhir_source)
+    )
+    assert response.json()["entry"][0]["response"]["status"] == "200 OK", response.text
+    row = FhirAuxResource.objects.get(resource_type="Condition", fhir_resource_id="epic-cond-1")
+    assert row.fhir_data["code"] == {"text": "mine"}
 
 
 def test_reimport_under_a_different_source_creates_a_second_record(api_client, patient, device, fhir_source):
     # Each source is its own identifier namespace, so the same upstream id under a second source
-    # is a second record -- which is what makes "every Connect registers a new source" safe.
+    # is a second record, not an overwrite of the first source's copy.
     other = FhirSource.objects.create(patient=patient, data_source=device, label="Second connect")
     r4 = _r4_condition(patient, "epic-cond-1")
     first = api_client.post("/fhir-import/R4/Condition", r4, **_src(fhir_source))
     second = api_client.post("/fhir-import/R4/Condition", r4, **_src(other))
-    assert all(r.json()["entry"][0]["response"]["status"].startswith("2") for r in (first, second))
+    assert all(r.json()["entry"][0]["response"]["status"] == "201 Created" for r in (first, second))
     assert FhirAuxResource.objects.filter(resource_type="Condition", fhir_resource_id="epic-cond-1").count() == 2
 
 
@@ -587,8 +644,9 @@ def test_import_long_epic_id_lands_in_an_identifier(api_client, patient, fhir_so
     created = first.json()["entry"][0]["resource"]
     assert {"system": fhir_source_uri(fhir_source.pk), "value": long_id} in created["identifier"]
 
+    # A re-import matches on the long id too, and overwrites rather than adding a second row.
     again = api_client.post("/fhir-import/R4/Condition", r4, **_src(fhir_source))
-    assert again.json()["entry"][0]["response"]["status"].startswith("409")
+    assert again.json()["entry"][0]["response"]["status"] == "200 OK", again.text
     assert FhirAuxResource.objects.filter(resource_type="Condition", fhir_resource_id=long_id).count() == 1
 
 
@@ -746,28 +804,18 @@ def test_import_bundle_reports_per_entry_error(api_client, patient, fhir_source)
 # ---------------------------------------------------------------------------
 # Pull-list invariants: everything the EHR Patient Portal client pulls must convert
 # to valid R5 (with import-path enrichment applied), and every pulled type must
-# have a matching seeded scope. These are the invariants RFC 0003 states.
+# have a matching entry in EhrBrand.SUPPORTED_SCOPES. These are the invariants RFC 0003 states.
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_SEED_PY_PATH = _REPO_ROOT / "core" / "management" / "commands" / "seed.py"
 _CLIENT_JS = _REPO_ROOT / "core" / "static" / "clients" / "ehr-patient-portal" / "js" / "client-ehr-patient-portal.js"
 
 
 def _pulled_types():
     text = _CLIENT_JS.read_text()
-    match = re.search(r"var EHR_PATIENT_PORTAL_PULLS = \[(.*?)\n\];", text, re.DOTALL)
+    match = re.search(r"const EHR_PATIENT_PORTAL_PULLS = \[(.*?)\n\];", text, re.DOTALL)
     assert match, "EHR_PATIENT_PORTAL_PULLS not found in client-ehr-patient-portal.js — was it renamed or reformatted?"
     return set(re.findall(r'type: "(\w+)"', match.group(1)))
-
-
-def _ehr_patient_portal_seed_scopes():
-    # Scope the parse to the EHR Patient Portal client's aux_data block — a future client with
-    # its own patient/*.read scopes elsewhere in seed.py must not bleed into this invariant.
-    text = _SEED_PY_PATH.read_text()
-    match = re.search(r'"name": "EHR Patient Portal".*?"scopes": \((.*?)\)', text, re.DOTALL)
-    assert match, 'EHR Patient Portal client "scopes" block not found in seed.py'
-    return match.group(1)
 
 
 # Minimal Epic-shaped R4 instance per pulled type (Patient/Condition/Observation etc. are
@@ -843,16 +891,19 @@ def test_every_pulled_type_converts_to_valid_r5(resource_type):
     validate_fhir_resource(resource_type, r5)
 
 
-def test_pulled_types_match_seeded_scopes():
-    scoped = set(re.findall(r"patient/(\w+)\.read", _ehr_patient_portal_seed_scopes()))
-    assert scoped == _pulled_types(), "seed.py EHR Patient Portal scopes and EHR_PATIENT_PORTAL_PULLS diverged"
+def test_pulled_types_match_supported_scopes_catalog():
+    from core.models import EhrVendor
+
+    scoped = {token.removeprefix("patient/").removesuffix(".read") for token in EhrVendor.SUPPORTED_SCOPES}
+    assert scoped == _pulled_types(), "EhrVendor.SUPPORTED_SCOPES and EHR_PATIENT_PORTAL_PULLS diverged"
 
 
-def test_scope_migration_matches_seed_and_updates_existing_clients(db):
-    # Migration 0043 widened the scopes on already-deployed rows, back when seed.py wrote
-    # aux_data only on creation. seed now refreshes the seed-managed keys on every run
-    # (test_seed_refreshes_scopes_on_existing_client), but 0043 stays: it is the only thing
-    # that fixes a database still sitting behind it, and `migrate` is all a deploy runs.
+def test_scope_migration_still_applies_to_a_historical_deployed_row(db):
+    # Migration 0043 widened the scopes on already-deployed rows, back when scopes lived on
+    # JheClient.aux_data (moved to EhrBrand.supported_scopes since). It is frozen history --
+    # the only thing that fixes a database still sitting behind it, and `migrate` is all a
+    # deploy runs -- so it is never touched, even though nothing in the live app reads
+    # JheClient.aux_data["scopes"] anymore.
     #
     # It filters on the *old* client name — it ran before 0046 renamed the row to
     # "EHR Patient Portal", and applied migrations are frozen history. The row created below
@@ -866,13 +917,6 @@ def test_scope_migration_matches_seed_and_updates_existing_clients(db):
 
     migration = importlib.import_module("core.migrations.0043_patient_access_scopes")
 
-    # Lockstep guard: the migration's scope list is a copy of seed.py's and must cover the pulls.
-    assert set(re.findall(r"patient/(\w+)\.read", migration.NEW_SCOPES)) == _pulled_types()
-    assert migration.NEW_SCOPES == "".join(
-        part.strip().strip('"') for part in _ehr_patient_portal_seed_scopes().splitlines() if part.strip()
-    )
-
-    # Functional guard: an existing deployed row gets the new scopes; its client_id survives.
     app = get_application_model().objects.create(name="Patient Access", client_id="local-app-id")
     JheClient.objects.create(
         application=app, aux_data={"client_id": "deployed-epic-id", "scopes": migration.OLD_SCOPES}
@@ -883,36 +927,25 @@ def test_scope_migration_matches_seed_and_updates_existing_clients(db):
     assert aux["client_id"] == "deployed-epic-id"
 
 
-def test_seed_refreshes_scopes_on_existing_client_without_clobbering_client_id(db):
-    # The create-only `if created:` guard is what forced migration 0043 to exist: a deployed
-    # row could never pick a code-owned aux_data value up from seed. Seed now refreshes the
-    # seed-managed keys on every run, while deployment-specific ones (the EHR-registered
-    # client_id) still survive re-seeding.
-    import importlib
-
-    from oauth2_provider.models import get_application_model
-
+def test_seed_fills_ehr_vendor_client_config_without_clobbering_operator_value(db):
+    # ehr_client_id/supported_scopes are operator-editable (via the EHRs admin page) once a
+    # vendor exists, so re-seeding must fill them in only when blank -- never overwrite an
+    # operator's edit, the same fill-gap contract the old aux_data client_id had.
     from core.management.commands.seed import Command
-    from core.models import JheClient
+    from core.models import EhrVendor
 
-    migration = importlib.import_module("core.migrations.0043_patient_access_scopes")
+    vendor = EhrVendor.objects.create(name="Epic Sandbox")
 
-    app = get_application_model().objects.create(name="EHR Patient Portal", client_id="local-app-id")
-    JheClient.objects.create(
-        application=app,
-        invitation_url="https://deployed.example/invite/CODE",
-        aux_data={"client_id": "deployed-epic-id", "scopes": migration.OLD_SCOPES},
-    )
+    Command.seed_ehr_vendor_sandbox_config()
+    vendor.refresh_from_db()
+    assert vendor.ehr_client_id
+    assert set(vendor.supported_scopes.split()) == set(EhrVendor.SUPPORTED_SCOPES)
 
-    command = Command()
-    command.seed_codeable_concepts()
-    command.seed_data_sources()
-    command.seed_clients()
-
-    jhe_client = JheClient.objects.get(application=app)
-    assert jhe_client.aux_data["scopes"] == migration.NEW_SCOPES, "seed did not refresh the code-owned scopes"
-    assert jhe_client.aux_data["client_id"] == "deployed-epic-id", "seed clobbered a deployment-specific value"
-    assert jhe_client.invitation_url == "https://deployed.example/invite/CODE"
+    vendor.ehr_client_id = "operator-set-id"
+    vendor.save()
+    Command.seed_ehr_vendor_sandbox_config()
+    vendor.refresh_from_db()
+    assert vendor.ehr_client_id == "operator-set-id", "reseeding clobbered an operator-set client id"
 
 
 def test_seed_links_the_portal_client_to_its_data_source(db):

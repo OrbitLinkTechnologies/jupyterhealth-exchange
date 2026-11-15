@@ -71,6 +71,12 @@ const ROUTES = {
     iconClass: "bi-boxes",
     action: "renderDataSources",
   },
+  ehrs: {
+    label: "EHRs",
+    iconClass: "bi-hospital",
+    action: "renderEhrVendors",
+    superuserOnly: true,
+  },
   debug: {
     label: "Debug",
     iconClass: "bi-bug",
@@ -97,6 +103,7 @@ const actions = {
   renderFhir,
   renderClients,
   renderDataSources,
+  renderEhrVendors,
   renderDebug,
   renderProfile,
 };
@@ -565,6 +572,22 @@ async function renderOrganizations(queryParams) {
   const topLevelOrganizationsPaginated =
     await topLevelOrganizationsResponse.json();
   let topLevelOrganizationsSelect = topLevelOrganizationsPaginated.results;
+
+  // The top-level select + tree only reach organizations below a TLO the user has a
+  // direct role in. A member/viewer of a sub-org several levels down may have no role
+  // anywhere in that chain, leaving them no way to reach their own org through that
+  // navigation -- so also offer a flat shortcut straight to every org they belong to.
+  const ownOrganizationsResponse = await apiRequest("GET", "users/organizations");
+  const myOrganizations = (await ownOrganizationsResponse.json()).map(
+    (organization) => {
+      organization.canManage = ifRoleCan(
+        organization.currentUserRole,
+        "organization.manage_for_practitioners"
+      );
+      return organization;
+    }
+  );
+
   let organizationTreeChildren = [];
   let canManagePractitionersInOrg;
   let organizationRecord = null;
@@ -591,29 +614,50 @@ async function renderOrganizations(queryParams) {
         organizationRecord.currentUserRole,
         "organization.manage_for_practitioners"
       );
-    }
 
-    const organizationTreeResaponse = await apiRequest(
-      "GET",
-      `organizations/${queryParams.tloId}/tree`
-    );
-    const organizationTree = await organizationTreeResaponse.json();
-    // Each node's manage permission is based on the user's role in that node
-    // itself, not the top-level organization (a manager of a sub-org may have
-    // no role in the root). Annotate every node so the tree can show the right
-    // action icons per node.
-    const annotateCanManage = (organizations) => {
+      // The tree endpoint requires a direct role in this org -- an org that's only
+      // visible as an ancestor of one the user belongs to (no currentUserRole) has
+      // no accessible tree, so don't ask for one.
+      const organizationTreeResaponse = await apiRequest(
+        "GET",
+        `organizations/${queryParams.tloId}/tree`
+      );
+      const organizationTree = await organizationTreeResaponse.json();
+      // Each node's manage permission is based on the user's role in that node
+      // itself, not the top-level organization (a manager of a sub-org may have
+      // no role in the root). Annotate every node so the tree can show the right
+      // action icons per node.
+      const annotateCanManage = (organizations) => {
+        (organizations || []).forEach((organization) => {
+          organization.canManage = ifRoleCan(
+            organization.currentUserRole,
+            "organization.manage_for_practitioners"
+          );
+          annotateCanManage(organization.children);
+        });
+      };
+      annotateCanManage(organizationTree.children);
+      organizationTreeChildren = organizationTree.children;
+    }
+  }
+
+  // An org already reachable in the currently displayed tree (the selected TLO plus
+  // whatever descendants it revealed) doesn't need to also appear in the "Your
+  // organizations" shortcut -- that's only useful for orgs the tree can't reach.
+  const treeVisibleOrganizationIds = new Set();
+  if (queryParams.tloId && queryParams.tloId != 0) {
+    treeVisibleOrganizationIds.add(parseInt(queryParams.tloId));
+    const collectTreeIds = (organizations) => {
       (organizations || []).forEach((organization) => {
-        organization.canManage = ifRoleCan(
-          organization.currentUserRole,
-          "organization.manage_for_practitioners"
-        );
-        annotateCanManage(organization.children);
+        treeVisibleOrganizationIds.add(organization.id);
+        collectTreeIds(organization.children);
       });
     };
-    annotateCanManage(organizationTree.children);
-    organizationTreeChildren = organizationTree.children;
+    collectTreeIds(organizationTreeChildren);
   }
+  const myOrganizationsNotInTree = myOrganizations.filter(
+    (organization) => !treeVisibleOrganizationIds.has(organization.id)
+  );
 
   let partOfId, partOfName;
 
@@ -680,16 +724,31 @@ async function renderOrganizations(queryParams) {
     }
 
     if (queryParams.read) {
-      const organizationUsersResponse = await apiRequest(
-        "GET",
-        `organizations/${queryParams.id}/users`
-      );
-      organizationRecord.users = await organizationUsersResponse.json();
-      const organizationStudiesResponse = await apiRequest(
-        "GET",
-        `organizations/${queryParams.id}/studies`
-      );
-      organizationRecord.studies = await organizationStudiesResponse.json();
+      // The member roster requires "organization.view_members" (managers/members, not
+      // viewers, and not an org where the user has no direct role at all -- e.g. one
+      // that's only visible as an ancestor of an org they belong to).
+      if (ifRoleCan(organizationRecord.currentUserRole, "organization.view_members")) {
+        const organizationUsersResponse = await apiRequest(
+          "GET",
+          `organizations/${queryParams.id}/users`
+        );
+        organizationRecord.users = await organizationUsersResponse.json();
+      } else {
+        organizationRecord.users = [];
+        organizationRecord.usersHidden = true;
+      }
+
+      // Studies require a direct role in this org, same as the tree.
+      if (organizationRecord.currentUserRole) {
+        const organizationStudiesResponse = await apiRequest(
+          "GET",
+          `organizations/${queryParams.id}/studies`
+        );
+        organizationRecord.studies = await organizationStudiesResponse.json();
+      } else {
+        organizationRecord.studies = [];
+        organizationRecord.studiesHidden = true;
+      }
     }
   }
 
@@ -706,6 +765,7 @@ async function renderOrganizations(queryParams) {
   const renderParams = {
     ...queryParams,
     topLevelOrganizationsSelect: topLevelOrganizationsSelect,
+    myOrganizations: myOrganizationsNotInTree,
     children: organizationTreeChildren,
     organizationRecord: organizationRecord,
     canManagePractitionersInOrg: canManagePractitionersInOrg,
@@ -1042,7 +1102,8 @@ async function renderPatients(queryParams) {
     patientRecord,
     studiesPendingConsent,
     studiesConsented,
-    consolidatedClients;
+    consolidatedClients,
+    fhirSources;
 
   const pageSize = parseInt(queryParams.pageSize) || 20;
   const page = parseInt(queryParams.page) || 1;
@@ -1091,9 +1152,20 @@ async function renderPatients(queryParams) {
         ...client,
         patientInvitations: client.patientInvitations.map((inv) => ({
           ...inv,
+          lastUpdatedFull: inv.lastUpdated,
           lastUpdated: inv.lastUpdated.slice(0, 10),
           status: inv.status.charAt(0).toUpperCase() + inv.status.slice(1),
         })),
+      }));
+
+      const fhirSourcesResponse = await apiRequest(
+        "GET",
+        `patients/${queryParams.id}/fhir_sources`,
+      );
+      // The label is cut to fit a list line; the full last-updated time goes in the hover title.
+      fhirSources = (await fhirSourcesResponse.json()).map((source) => ({
+        ...source,
+        labelTruncated: source.label.length > 50 ? source.label.slice(0, 50) + "..." : source.label,
       }));
     }
   } else if (queryParams.create && queryParams.lookedUpEmail) {
@@ -1133,6 +1205,7 @@ async function renderPatients(queryParams) {
     pageSizes: [20, 100, 500, 1000],
     canManagePatientsInOrg: canManagePatientsInOrg,
     consolidatedClients: consolidatedClients,
+    fhirSources: fhirSources,
   };
 
   return content(renderParams);
@@ -2337,6 +2410,111 @@ async function removeScopeFromDataSource(scopeCodeId, dataSourceId) {
     }
   );
   if (response.ok) navReload();
+}
+
+// ────────────────────────────────────────────────────
+// EHRs (EhrVendor; EhrBrand/EhrBrandLocation are read-only, nested for display)
+// ────────────────────────────────────────────────────
+
+// {token, label} per CONSTANTS.EHR_SUPPORTED_SCOPES entry, checked when it appears in the
+// vendor's space-delimited supportedScopes string.
+function buildEhrVendorScopeOptions(selectedString) {
+  const selected = (selectedString || "").split(/\s+/).filter(Boolean);
+  return Object.entries(CONSTANTS.EHR_SUPPORTED_SCOPES).map(([token, label]) => ({
+    token: token,
+    label: label,
+    checked: selected.indexOf(token) !== -1,
+  }));
+}
+
+// Friendly labels for a vendor's space-delimited supportedScopes string, for the list table.
+function ehrVendorScopeLabels(selectedString) {
+  return (selectedString || "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((token) => CONSTANTS.EHR_SUPPORTED_SCOPES[token])
+    .filter(Boolean);
+}
+
+function readEhrVendorScopeCheckboxes() {
+  return Array.from(document.querySelectorAll(".ehrVendorScopeCheckbox:checked"))
+    .map((el) => el.value)
+    .join(" ");
+}
+
+async function renderEhrVendors(queryParams) {
+  const content = Handlebars.compile(
+    document.getElementById("t-ehr-vendors").innerHTML
+  );
+
+  const ehrVendorsResponse = await apiRequest("GET", "ehr_vendors");
+  const ehrVendorsPaginated = await ehrVendorsResponse.json();
+  const ehrVendors = ehrVendorsPaginated.results.map((vendor) => ({
+    ...vendor,
+    scopeLabels: ehrVendorScopeLabels(vendor.supportedScopes),
+  }));
+  let ehrVendorRecord = {};
+
+  if (queryParams.read || queryParams.update || queryParams.delete) {
+    const ehrVendorRecordResponse = await apiRequest(
+      "GET",
+      `ehr_vendors/${queryParams.id}`
+    );
+    ehrVendorRecord = await ehrVendorRecordResponse.json();
+  }
+
+  ehrVendorRecord.scopeOptions = buildEhrVendorScopeOptions(ehrVendorRecord.supportedScopes);
+
+  Handlebars.registerPartial(
+    "crudButton",
+    document.getElementById("t-crudButton").innerHTML
+  );
+
+  const renderParams = {
+    ...queryParams,
+    ehrVendors: ehrVendors,
+    ehrVendorRecord: ehrVendorRecord,
+    // The EHRs route is superuserOnly, so anyone who can reach this page can manage it.
+    canManageEhrVendors: true,
+  };
+
+  return content(renderParams);
+}
+
+function validateEhrVendorForm() {
+  const errors = [];
+  const name = document.getElementById("ehrVendorName")?.value?.trim() || "";
+  if (!name) errors.push("Name is required.");
+  return errors;
+}
+
+function readEhrVendorForm() {
+  return {
+    name: document.getElementById("ehrVendorName").value || null,
+    ehrClientId: document.getElementById("ehrVendorEhrClientId").value || null,
+    supportedScopes: readEhrVendorScopeCheckboxes() || null,
+  };
+}
+
+async function createEhrVendor() {
+  clearModalValidationErrors();
+  const errors = validateEhrVendorForm();
+  if (errors.length) return displayModalValidationError(errors);
+  if (await apiRequest("POST", `ehr_vendors`, readEhrVendorForm()))
+    await navReturnFromCrud();
+}
+
+async function updateEhrVendor(id) {
+  clearModalValidationErrors();
+  const errors = validateEhrVendorForm();
+  if (errors.length) return displayModalValidationError(errors);
+  const response = await apiRequest("PATCH", `ehr_vendors/${id}`, readEhrVendorForm());
+  if (response.ok) await navReturnFromCrud();
+}
+
+async function deleteEhrVendor(id) {
+  if (await apiRequest("DELETE", `ehr_vendors/${id}`))
+    await navReturnFromCrud();
 }
 
 // ────────────────────────────────────────────────────

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import traceback
 import urllib.parse
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
@@ -13,7 +15,7 @@ from jhe_mcp.auth.oauth_flow import AuthenticationRequired
 from jhe_mcp.auth.token_verifier import JheTokenVerifier
 from jhe_mcp.config import Settings
 from jhe_mcp.fhir.capabilities import get_capabilities
-from jhe_mcp.omh_registry import all_schema_ids, all_short_names, load_schema, short_name
+from jhe_mcp.omh_registry import all_schema_ids, all_short_names, load_schema, schema_ids_for, short_name
 from jhe_mcp.tools import observation_counts, observation_views
 from jhe_mcp.tools import patients as patient_tools
 from jhe_mcp.tools import study as study_tools
@@ -71,6 +73,24 @@ Efficient workflows — do NOT dump or page through records just to count or fin
 """
 
 
+class _LoggingFastMCP(FastMCP):
+    """FastMCP that logs a tool's traceback; the SDK only returns the error to the client."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        try:
+            return await super().call_tool(name, arguments)
+        except Exception as exc:
+            cause = exc.__cause__ or exc
+            # Type and stack only: messages can echo JHE response bodies (PHI), which audit.py keeps out of logs.
+            logger.error(
+                "Tool %s failed with %s\n%s",
+                name,
+                type(cause).__name__,
+                "".join(traceback.format_tb(cause.__traceback__)),
+            )
+            raise
+
+
 def build_server(
     settings: Settings,
     pre_tool_hook: Callable[[], Awaitable[None]] | None = None,
@@ -85,7 +105,7 @@ def build_server(
         allowed_hosts=allowed_hosts,
         allowed_origins=allowed_origins,
     )
-    mcp = FastMCP(
+    mcp = _LoggingFastMCP(
         name="jhe-mcp",
         instructions=SERVER_INSTRUCTIONS,
         transport_security=transport_security,
@@ -128,18 +148,20 @@ def build_server(
 
     @mcp.tool()
     async def get_omh_schema(name: str) -> dict | str:
-        """Return the full OMH JSON schema for a data type short name.
+        """Return the full OMH JSON schema for a data type short name or full schema id.
 
         Known names: blood-glucose, blood-pressure, body-temperature,
-        heart-rate, heart-rate-variability, oxygen-saturation,
+        heart-rate, oxygen-saturation,
         physical-activity, respiratory-rate, rr-interval,
         sleep-duration, sleep-episode, step-count.
+        A short name served by both IEEE and OMH (sleep-episode,
+        physical-activity) returns the IEEE schema; pass a full id such as
+        'omh:sleep-episode:1.1' for the other one.
         """
         if auth_msg := await _before():
             return auth_msg
-        for sid in all_schema_ids():
-            if short_name(sid) == name:
-                return load_schema(sid)
+        if ids := schema_ids_for(name):
+            return load_schema(ids[0])  # ieee sorts before omh when the short name is ambiguous
         return {"error": f"Unknown schema name {name!r}", "known": all_short_names()}
 
     @mcp.tool()
@@ -257,8 +279,10 @@ def build_server(
         value/unit) and omits the raw OMH body; verbosity='full' includes it.
         order='newest' (default) returns most recent first; 'oldest' returns
         oldest first. Filter by OMH data type short name (e.g. 'blood-glucose')
-        and ISO dates. limit is capped at 1000; requesting a page past the end
-        returns an error — follow has_more instead.
+        or full schema id (e.g. 'omh:sleep-episode:1.1') and ISO dates; an
+        ambiguous short name tries the IEEE schema first and falls back to OMH
+        when that count is 0. limit is capped at 1000; requesting a page past
+        the end returns an error — follow has_more instead.
         """
         if auth_msg := await _before():
             return auth_msg
@@ -281,7 +305,12 @@ def build_server(
         start: str | None = None,
         end: str | None = None,
     ) -> int | str:
-        """Exact number of observations for a patient, without returning records."""
+        """Exact number of observations for a patient, without returning records.
+
+        data_type is a short name (e.g. 'heart-rate') or a full schema id
+        (e.g. 'omh:sleep-episode:1.1'); an ambiguous short name tries the IEEE
+        schema first and falls back to OMH when that count is 0.
+        """
         if auth_msg := await _before():
             return auth_msg
         return await observation_counts.count_patient_observations(
@@ -299,6 +328,9 @@ def build_server(
         """Observation count across a whole study in one call.
 
         With by_patient=True, returns {patient_id: count} instead of a total.
+        data_type is a short name (e.g. 'heart-rate') or a full schema id
+        (e.g. 'omh:sleep-episode:1.1'); an ambiguous short name tries the IEEE
+        schema first and falls back to OMH when the study-level count is 0.
         """
         if auth_msg := await _before():
             return auth_msg

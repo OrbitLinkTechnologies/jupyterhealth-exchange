@@ -3,7 +3,12 @@ from .aux_resource import FHIRBundledAuxResourceSerializer as FHIRBundledAuxReso
 from .data_source import CodeableConceptSerializer as CodeableConceptSerializer
 from .data_source import DataSourceSerializer as DataSourceSerializer
 from .data_source import DataSourceSupportedScopeSerializer as DataSourceSupportedScopeSerializer
+from .ehr_brand import EhrBrandLocationSerializer as EhrBrandLocationSerializer
+from .ehr_brand import EhrBrandSerializer as EhrBrandSerializer
+from .ehr_brand import EhrVendorListSerializer as EhrVendorListSerializer
+from .ehr_brand import EhrVendorSerializer as EhrVendorSerializer
 from .fhir_source import FhirSourceSerializer as FhirSourceSerializer
+from .fhir_source import PatientFhirSourceSerializer as PatientFhirSourceSerializer
 from .jhe_client import ClientDataSourceSerializer as ClientDataSourceSerializer
 from .jhe_client import ClientSerializer as ClientSerializer
 from .jhe_setting import JheSettingSerializer as JheSettingSerializer
